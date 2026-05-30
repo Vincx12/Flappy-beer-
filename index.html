@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Flappy Beer 🍺</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#0d0628; display:flex; justify-content:center; align-items:center;
+    height:100dvh; overflow:hidden; font-family:'Arial Black',sans-serif; touch-action:none;
+  }
+  #wrap { position:relative; width:100%; max-width:420px; height:100dvh; max-height:820px; }
+  canvas { display:block; width:100%; height:100%; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+"use strict";
+// ============================================================
+//  FLAPPY BEER  —  Canvas 2D, 60 FPS, mobile + desktop
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 420, H = 800;
+canvas.width = W; canvas.height = H;
+
+// ── Réglages gameplay ─────────────────────────────────────────
+const GRAVITY = 0.40;
+const FLAP    = -8.6;
+const SPEED   = 3.2;
+const GAP     = 200;          // espace franchissable
+const SPAWN   = 1650;         // ms entre obstacles
+const BX      = 92;           // position X bouteille
+const BW = 38, BH = 92;       // taille bouteille
+const OPENER_W = 80;          // largeur d'un décapsuleur (= largeur sprite)
+const FLOOR = 60;             // hauteur du sol
+
+// ── État ──────────────────────────────────────────────────────
+let state = 'START';          // START | PLAY | DEAD | OVER
+let score = 0;
+let best  = parseInt(localStorage.getItem('flappyBeerBest') || '0');
+let last  = 0, spawnT = 0;
+const bird = { x:BX, y:H/2, vy:0, rot:0, opened:false, cap:null, shake:0 };
+let pipes = [];
+
+// ── Décor ─────────────────────────────────────────────────────
+const stars = Array.from({length:55},()=>({x:Math.random()*W,y:Math.random()*H*0.62,r:Math.random()*1.8+0.4,a:Math.random(),da:(Math.random()-0.5)*0.015}));
+const clouds= Array.from({length:5},(_,i)=>({x:i*(W/4),y:70+Math.random()*120,r:30+Math.random()*25,s:0.4+Math.random()*0.3}));
+
+// ============================================================
+//  SPRITE DÉCAPSULEUR  —  pré-rendu sur un canvas dédié
+//  Orientation : tête en BAS du sprite (= bord actif/encoche),
+//  manche vers le HAUT. On le retourne pour l'obstacle du bas.
+// ============================================================
+function buildOpener() {
+  const SW = 80, SH = 104;
+  const cv = document.createElement('canvas');
+  cv.width = SW; cv.height = SH;
+  const g = cv.getContext('2d');
+
+  const cx = SW/2;
+  const handleW = 30;
+  const R  = 36;                 // rayon tête
+  const cy = SH - R - 4;         // centre tête (bas de tête ≈ SH-4)
+
+  // Dégradé acier clair et lumineux (bien visible sur fond sombre)
+  const steel = g.createLinearGradient(cx-R, 0, cx+R, 0);
+  steel.addColorStop(0.00,'#62788a');
+  steel.addColorStop(0.16,'#a9c2cf');
+  steel.addColorStop(0.38,'#e6f2f8');
+  steel.addColorStop(0.50,'#ffffff');
+  steel.addColorStop(0.62,'#e6f2f8');
+  steel.addColorStop(0.84,'#a9c2cf');
+  steel.addColorStop(1.00,'#62788a');
+
+  // ── 1. SILHOUETTE (manche stub + tête arrondie) ──
+  g.beginPath();
+  g.moveTo(cx - handleW/2, 0);
+  g.lineTo(cx - handleW/2, 22);
+  g.bezierCurveTo(cx - handleW/2, 40, cx - R, cy - R*0.55, cx - R, cy);
+  g.arc(cx, cy, R, Math.PI, 0, true);   // arc par le BAS (gauche→bas→droite)
+  g.bezierCurveTo(cx + R, cy - R*0.55, cx + handleW/2, 40, cx + handleW/2, 22);
+  g.lineTo(cx + handleW/2, 0);
+  g.closePath();
+  g.fillStyle = steel; g.fill();
+  g.strokeStyle = '#33485a'; g.lineWidth = 3; g.stroke();
+
+  // ── 2. TROU EN CŒUR (vraie découpe via destination-out) ──
+  function heart(gg, hx, hy, hw, hh) {
+    gg.beginPath();
+    gg.moveTo(hx, hy + hh*0.28);
+    gg.bezierCurveTo(hx, hy, hx - hw, hy, hx - hw, hy + hh*0.32);
+    gg.bezierCurveTo(hx - hw, hy + hh*0.58, hx, hy + hh*0.80, hx, hy + hh);
+    gg.bezierCurveTo(hx, hy + hh*0.80, hx + hw, hy + hh*0.58, hx + hw, hy + hh*0.32);
+    gg.bezierCurveTo(hx + hw, hy, hx, hy, hx, hy + hh*0.28);
+    gg.closePath();
+  }
+  const hTopY = cy - R*0.46, hH = R*0.96, hW = R*0.52;
+  g.save();
+  g.globalCompositeOperation = 'destination-out';
+  heart(g, cx, hTopY, hW, hH); g.fill();
+  // encoche d'accroche au bord bas (petit slot ouvert)
+  g.beginPath(); g.roundRect(cx-9, cy + R - 14, 18, 18, 4); g.fill();
+  g.restore();
+
+  // ── 3. CONTOUR du trou cœur (gris foncé) ──
+  heart(g, cx, hTopY, hW, hH);
+  g.strokeStyle = '#2a3c4c'; g.lineWidth = 2; g.stroke();
+
+  // ── 4. REFLETS ──
+  g.beginPath();
+  g.ellipse(cx - R*0.42, cy - R*0.35, R*0.16, R*0.42, -0.4, 0, Math.PI*2);
+  g.fillStyle = 'rgba(255,255,255,0.55)'; g.fill();
+  g.beginPath();
+  g.moveTo(cx - handleW/2 + 4, 4);
+  g.lineTo(cx - handleW/2 + 4, 24);
+  g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 2.5; g.stroke();
+
+  return cv;
+}
+const OPENER = buildOpener();
+const SPR_H = OPENER.height;
+
+// Manche métallique extensible (relie la tête au bord de l'écran)
+function drawHandle(cx, y1, y2) {
+  if (y2 - y1 <= 2) return;
+  const w = 30;
+  const g = ctx.createLinearGradient(cx - w/2, 0, cx + w/2, 0);
+  g.addColorStop(0.00,'#62788a'); g.addColorStop(0.30,'#a9c2cf');
+  g.addColorStop(0.50,'#ffffff'); g.addColorStop(0.70,'#a9c2cf');
+  g.addColorStop(1.00,'#62788a');
+  ctx.beginPath(); ctx.roundRect(cx - w/2, y1, w, y2 - y1, 6);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = '#33485a'; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx - w/2 + 4, y1); ctx.lineTo(cx - w/2 + 4, y2);
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.lineWidth = 2.5; ctx.stroke();
+}
+
+// Dessine un obstacle complet (haut + bas) pour un pipe donné
+function drawOpener(px, gapY, isTop) {
+  const cx = px + OPENER_W / 2;
+  if (isTop) {
+    const headTop = gapY - SPR_H;          // tête juste au-dessus du passage
+    drawHandle(cx, 0, headTop + 16);       // manche du haut de l'écran à la tête
+    ctx.drawImage(OPENER, cx - OPENER_W/2, headTop);
+  } else {
+    const edge = gapY + GAP;               // bord actif (haut de l'obstacle bas)
+    drawHandle(cx, edge + SPR_H - 16, H - FLOOR);
+    ctx.save();
+    ctx.translate(cx, edge + SPR_H);
+    ctx.scale(1, -1);                      // miroir vertical
+    ctx.drawImage(OPENER, -OPENER_W/2, 0);
+    ctx.restore();
+  }
+}
+
+// ============================================================
+//  SPRITE BOUTEILLE (style Heineken) — dessin direct
+// ============================================================
+function drawBottle(bx, by, rot, opened) {
+  ctx.save();
+  ctx.translate(bx + BW/2, by + BH/2);
+  ctx.rotate(rot);
+
+  const bodyW = BW - 2, bodyH = BH*0.50;
+  const BASE = BH/2, bodyTop = BASE - bodyH;
+  const shldH = BH*0.16, neckW = 8, neckH = BH*0.20;
+  const neckTop = bodyTop - shldH - neckH;
+  const mouthW = 6, mouthH = 7, mouthTop = neckTop - mouthH;
+
+  // ombre
+  ctx.beginPath(); ctx.ellipse(1, BASE+2, bodyW/2-2, 4, 0, 0, Math.PI*2);
+  ctx.fillStyle='rgba(0,0,0,0.28)'; ctx.fill();
+
+  const gv = ctx.createLinearGradient(-bodyW/2,0,bodyW/2,0);
+  gv.addColorStop(0,'#0b2a0b'); gv.addColorStop(0.15,'#165a16');
+  gv.addColorStop(0.35,'#22901a'); gv.addColorStop(0.52,'#38c030');
+  gv.addColorStop(0.68,'#22901a'); gv.addColorStop(0.85,'#165a16');
+  gv.addColorStop(1,'#0b2a0b');
+
+  // corps
+  ctx.beginPath(); ctx.roundRect(-bodyW/2, bodyTop, bodyW, bodyH, [0,0,11,11]);
+  ctx.fillStyle=gv; ctx.fill(); ctx.strokeStyle='#092009'; ctx.lineWidth=1.5; ctx.stroke();
+  // épaules
+  ctx.beginPath();
+  ctx.moveTo(-bodyW/2, bodyTop+2);
+  ctx.bezierCurveTo(-bodyW/2, bodyTop-shldH*0.5, -neckW/2-3, bodyTop-shldH*0.85, -neckW/2, bodyTop-shldH);
+  ctx.lineTo(neckW/2, bodyTop-shldH);
+  ctx.bezierCurveTo(neckW/2+3, bodyTop-shldH*0.85, bodyW/2, bodyTop-shldH*0.5, bodyW/2, bodyTop+2);
+  ctx.closePath(); ctx.fillStyle=gv; ctx.fill(); ctx.strokeStyle='#092009'; ctx.lineWidth=1.5; ctx.stroke();
+  // col
+  ctx.beginPath(); ctx.roundRect(-neckW/2, neckTop, neckW, neckH, [2,2,0,0]);
+  ctx.fillStyle=gv; ctx.fill(); ctx.strokeStyle='#092009'; ctx.lineWidth=1.5; ctx.stroke();
+  // bague
+  ctx.beginPath(); ctx.roundRect(-neckW/2-1, neckTop+neckH*0.6, neckW+2, 4, 1);
+  ctx.fillStyle='#1a7a1a'; ctx.fill(); ctx.strokeStyle='#082808'; ctx.lineWidth=1; ctx.stroke();
+  // embouchure
+  ctx.beginPath(); ctx.roundRect(-mouthW/2, mouthTop, mouthW, mouthH, [2,2,0,0]);
+  ctx.fillStyle=gv; ctx.fill(); ctx.strokeStyle='#092009'; ctx.lineWidth=1.5; ctx.stroke();
+
+  // étiquette ronde + étoile
+  const lbY = bodyTop + bodyH*0.38, lbR = bodyW*0.42;
+  ctx.beginPath(); ctx.arc(0,lbY,lbR,0,Math.PI*2);
+  ctx.fillStyle='#145a14'; ctx.fill(); ctx.strokeStyle='#c8a000'; ctx.lineWidth=1.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0,lbY,lbR*0.68,0,Math.PI*2); ctx.fillStyle='#fff'; ctx.fill();
+  ctx.font=`bold ${Math.round(lbR*0.85)}px Arial`;
+  ctx.fillStyle='#cc0808'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('★', 0, lbY-lbR*0.06);
+  ctx.font=`bold ${Math.round(lbR*0.34)}px Arial Black`;
+  ctx.fillStyle='#fff'; ctx.textBaseline='alphabetic'; ctx.fillText('FLAPPY', 0, lbY+lbR*0.64);
+
+  // reflets
+  ctx.beginPath(); ctx.moveTo(-bodyW/2+4,bodyTop+5); ctx.lineTo(-bodyW/2+6,bodyTop+bodyH-10);
+  ctx.strokeStyle='rgba(255,255,255,0.20)'; ctx.lineWidth=2.5; ctx.stroke();
+
+  // bulles
+  if (!opened) {
+    const t = Date.now()/500;
+    [[-5,bodyTop+bodyH*0.75],[2,bodyTop+bodyH*0.55],[-1,bodyTop+bodyH*0.88]].forEach(([x2,y2],i)=>{
+      const p=(t*0.4+i*0.33)%1, a=p<0.5?p*2:2-p*2;
+      ctx.beginPath(); ctx.arc(x2, y2-p*bodyH*0.55, 1.8, 0, Math.PI*2);
+      ctx.fillStyle=`rgba(255,255,200,${(a*0.35).toFixed(2)})`; ctx.fill();
+    });
+  }
+
+  // capsule rouge crénelée / mousse
+  if (!opened) {
+    const capY = mouthTop - 2, capR = mouthW/2 + 3.5;
+    ctx.beginPath(); ctx.arc(0, capY+capR, capR, 0, Math.PI*2);
+    ctx.fillStyle='#cc1010'; ctx.fill(); ctx.strokeStyle='#7a0000'; ctx.lineWidth=1; ctx.stroke();
+    for (let i=0;i<10;i++){ const ang=(i/10)*Math.PI*2;
+      ctx.beginPath(); ctx.arc(Math.cos(ang)*(capR+1.8), (capY+capR)+Math.sin(ang)*(capR+1.8), 2, 0, Math.PI*2);
+      ctx.fillStyle='#cc1010'; ctx.fill(); }
+    ctx.beginPath(); ctx.arc(-1.5, capY+capR-2.5, 2.5, 0, Math.PI*2);
+    ctx.fillStyle='rgba(255,255,255,0.3)'; ctx.fill();
+  } else {
+    const m=mouthTop; ctx.fillStyle='#fff8e7';
+    ctx.beginPath(); ctx.ellipse(0,m,11,8,0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(-6,m-5,7,5,-0.4,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(6,m-4,6,5,0.3,0,Math.PI*2); ctx.fill();
+    for (let a=0;a<7;a++){ const ang=(a/7)*Math.PI*2;
+      ctx.beginPath(); ctx.moveTo(Math.cos(ang)*8,m+Math.sin(ang)*8); ctx.lineTo(Math.cos(ang)*15,m+Math.sin(ang)*15);
+      ctx.strokeStyle='#f4a200'; ctx.lineWidth=1.5; ctx.stroke(); }
+  }
+  ctx.textBaseline='alphabetic';
+  ctx.restore();
+}
+
+// Capsule qui s'envole à la mort
+function drawCap() {
+  const c = bird.cap; if (!c) return;
+  ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+  ctx.beginPath(); ctx.arc(0,0,7,0,Math.PI*2);
+  ctx.fillStyle='#cc1010'; ctx.fill(); ctx.strokeStyle='#7a0000'; ctx.lineWidth=1; ctx.stroke();
+  for (let i=0;i<8;i++){ const a=(i/8)*Math.PI*2;
+    ctx.beginPath(); ctx.arc(Math.cos(a)*8.5,Math.sin(a)*8.5,2,0,Math.PI*2);
+    ctx.fillStyle='#cc1010'; ctx.fill(); }
+  ctx.restore();
+}
+
+// ============================================================
+//  AUDIO
+// ============================================================
+let ac = null;
+function sound(type){
+  try{
+    if(!ac) ac = new (window.AudioContext||window.webkitAudioContext)();
+    const o=ac.createOscillator(), g=ac.createGain(); o.connect(g); g.connect(ac.destination);
+    if(type==='flap'){o.type='sine';o.frequency.setValueAtTime(520,ac.currentTime);o.frequency.exponentialRampToValueAtTime(300,ac.currentTime+0.12);g.gain.setValueAtTime(0.18,ac.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ac.currentTime+0.12);o.start();o.stop(ac.currentTime+0.12);}
+    else if(type==='score'){o.type='triangle';o.frequency.setValueAtTime(880,ac.currentTime);o.frequency.exponentialRampToValueAtTime(1200,ac.currentTime+0.1);g.gain.setValueAtTime(0.25,ac.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ac.currentTime+0.15);o.start();o.stop(ac.currentTime+0.15);}
+    else if(type==='die'){o.type='sawtooth';o.frequency.setValueAtTime(300,ac.currentTime);o.frequency.exponentialRampToValueAtTime(60,ac.currentTime+0.4);g.gain.setValueAtTime(0.3,ac.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ac.currentTime+0.4);o.start();o.stop(ac.currentTime+0.4);}
+  }catch(e){}
+}
+
+// ============================================================
+//  FOND
+// ============================================================
+function drawBg(){
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0d0628'); g.addColorStop(0.6,'#1f0f4a'); g.addColorStop(1,'#120820');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  stars.forEach(s=>{ s.a+=s.da; if(s.a>1||s.a<0.1)s.da*=-1;
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2);
+    ctx.fillStyle=`rgba(255,255,220,${s.a.toFixed(2)})`; ctx.fill(); });
+  clouds.forEach(c=>{ if(state==='PLAY'){c.x-=c.s; if(c.x<-80)c.x=W+80;}
+    ctx.beginPath(); ctx.arc(c.x,c.y,c.r,0,Math.PI*2);
+    ctx.fillStyle='rgba(255,200,100,0.06)'; ctx.fill(); });
+  ctx.font='bold 18px Arial Black'; ctx.textAlign='left';
+  ctx.shadowColor='#ff6b35'; ctx.shadowBlur=12; ctx.fillStyle='#ff6b35'; ctx.fillText('🍺 BAR',30,60);
+  ctx.shadowColor='#00e5ff'; ctx.fillStyle='#00e5ff'; ctx.fillText('OPEN',W-110,80); ctx.shadowBlur=0;
+}
+function drawFloor(){
+  const y=H-FLOOR;
+  ctx.fillStyle='#2a1810'; ctx.fillRect(0,y,W,FLOOR);
+  for(let i=0;i<W;i+=40){ ctx.beginPath(); ctx.moveTo(i,y); ctx.lineTo(i,H);
+    ctx.strokeStyle='rgba(255,180,80,0.12)'; ctx.lineWidth=1; ctx.stroke(); }
+  ctx.fillStyle='#3a2010'; ctx.fillRect(0,y,W,4);
+}
+
+// ── HUD & écrans ─────────────────────────────────────────────
+function drawHUD(){
+  ctx.textAlign='center'; ctx.font='bold 46px Arial Black';
+  ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillText(score,W/2+2,72);
+  ctx.fillStyle='#ffd700'; ctx.shadowColor='#f4a200'; ctx.shadowBlur=12;
+  ctx.fillText(score,W/2,70); ctx.shadowBlur=0;
+}
+function drawStart(){
+  ctx.fillStyle='rgba(10,5,25,0.78)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.font='bold 52px Arial Black';
+  ctx.shadowColor='#ff6b35'; ctx.shadowBlur=20;
+  ctx.fillStyle='#ffd700'; ctx.fillText('🍺 FLAPPY',W/2,H/2-150);
+  ctx.fillStyle='#f7c59f'; ctx.fillText('BEER',W/2,H/2-92); ctx.shadowBlur=0;
+  // aperçu : décapsuleur + bouteille côte à côte
+  ctx.drawImage(OPENER, W/2-120, H/2-55, 70, 91);
+  drawBottle(W/2+50-BW/2, H/2-30, Math.sin(Date.now()/400)*0.12, false);
+  const p=0.85+0.15*Math.sin(Date.now()/350);
+  ctx.save(); ctx.translate(W/2,H/2+120); ctx.scale(p,p);
+  ctx.beginPath(); ctx.roundRect(-95,-26,190,52,26); ctx.fillStyle='#ff6b35'; ctx.fill();
+  ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+  ctx.font='bold 19px Arial Black'; ctx.fillStyle='#fff'; ctx.fillText('APPUYER POUR JOUER',0,7); ctx.restore();
+  if(best>0){ ctx.font='bold 18px Arial'; ctx.fillStyle='#ffd700'; ctx.fillText('🏆 Meilleur : '+best,W/2,H/2+195); }
+}
+function drawOver(){
+  ctx.fillStyle='rgba(10,5,25,0.82)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font='bold 46px Arial Black'; ctx.shadowColor='#e03030'; ctx.shadowBlur=18;
+  ctx.fillStyle='#ff4444'; ctx.fillText('DÉCAPSULÉ !',W/2,H/2-120); ctx.shadowBlur=0;
+  ctx.font='bold 26px Arial Black'; ctx.fillStyle='#ffd700'; ctx.fillText('Score : '+score,W/2,H/2-62);
+  if(score>=best&&score>0){ ctx.font='bold 20px Arial'; ctx.fillStyle='#f7c59f';
+    ctx.shadowColor='#f4a200'; ctx.shadowBlur=8; ctx.fillText('🎉 NOUVEAU RECORD !',W/2,H/2-28); ctx.shadowBlur=0; }
+  ctx.font='bold 20px Arial'; ctx.fillStyle='#c8d8e8'; ctx.fillText('Meilleur : '+best,W/2,H/2+8);
+  const p=0.88+0.12*Math.sin(Date.now()/350);
+  ctx.save(); ctx.translate(W/2,H/2+100); ctx.scale(p,p);
+  ctx.beginPath(); ctx.roundRect(-80,-26,160,52,26); ctx.fillStyle='#2ea84a'; ctx.fill();
+  ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+  ctx.font='bold 22px Arial Black'; ctx.fillStyle='#fff'; ctx.fillText('🔄 REJOUER',0,8); ctx.restore();
+}
+
+// ============================================================
+//  LOGIQUE
+// ============================================================
+function spawn(){
+  const minY=120, maxY=H-150-GAP;
+  pipes.push({ x:W+20, gapY:minY+Math.random()*(maxY-minY), scored:false });
+}
+function reset(){ score=0; pipes=[]; spawnT=0; bird.y=H/2-BH/2; bird.vy=0; bird.rot=0; bird.opened=false; bird.cap=null; bird.shake=0; }
+function start(){ reset(); state='PLAY'; flap(); }
+function flap(){ bird.vy=FLAP; bird.rot=-0.45; sound('flap'); }
+
+function hit(){
+  const m=8;
+  const L=bird.x+m, Rr=bird.x+BW-m, T=bird.y+m, B=bird.y+BH-m;
+  if(B>=H-FLOOR) return true;
+  if(T<=0) return true;
+  for(const p of pipes){
+    const pL=p.x+10, pR=p.x+OPENER_W-10;
+    if(Rr<pL||L>pR) continue;
+    if(T<p.gapY) return true;
+    if(B>p.gapY+GAP) return true;
+  }
+  return false;
+}
+function die(){
+  state='DEAD'; bird.opened=true;
+  bird.cap={x:bird.x+BW/2,y:bird.y-5,vx:(Math.random()-0.5)*9,vy:-11,rot:0,vrot:(Math.random()-0.5)*0.5};
+  sound('die');
+  if(score>best){ best=score; localStorage.setItem('flappyBeerBest',best); }
+  bird.shake=10; setTimeout(()=>{ state='OVER'; },1400);
+}
+
+function update(dt){
+  if(state!=='PLAY'&&state!=='DEAD') return;
+  bird.vy+=GRAVITY; bird.y+=bird.vy;
+  bird.rot+=(bird.vy*0.035-bird.rot)*0.12;
+  bird.rot=Math.max(-0.6,Math.min(1.4,bird.rot));
+  if(bird.shake>0) bird.shake-=0.8;
+  if(bird.cap){ bird.cap.x+=bird.cap.vx; bird.cap.y+=bird.cap.vy; bird.cap.vy+=0.5; bird.cap.rot+=bird.cap.vrot; if(bird.cap.y>H+20) bird.cap=null; }
+  if(state!=='PLAY') return;
+  spawnT+=dt; if(spawnT>=SPAWN){ spawn(); spawnT=0; }
+  for(const p of pipes){ p.x-=SPEED; if(!p.scored&&p.x+OPENER_W<bird.x){ p.scored=true; score++; sound('score'); } }
+  pipes=pipes.filter(p=>p.x>-100);
+  if(hit()) die();
+}
+
+function render(){
+  ctx.save();
+  if(bird.shake>1) ctx.translate((Math.random()-0.5)*bird.shake,(Math.random()-0.5)*bird.shake);
+  drawBg();
+  pipes.forEach(p=>{ drawOpener(p.x,p.gapY,true); drawOpener(p.x,p.gapY,false); });
+  drawFloor();
+  drawBottle(bird.x,bird.y,bird.rot,bird.opened);
+  drawCap();
+  if(state==='PLAY'||state==='DEAD') drawHUD();
+  if(state==='START') drawStart();
+  if(state==='OVER')  drawOver();
+  ctx.restore();
+}
+
+function loop(ts){
+  const dt=Math.min(ts-(last||ts),50); last=ts;
+  update(dt); render();
+  requestAnimationFrame(loop);
+}
+
+// ── Input ─────────────────────────────────────────────────────
+function input(){ if(state==='START'||state==='OVER') start(); else if(state==='PLAY') flap(); }
+canvas.addEventListener('click',input);
+canvas.addEventListener('touchstart',e=>{ e.preventDefault(); input(); },{passive:false});
+document.addEventListener('keydown',e=>{ if(e.code==='Space'||e.code==='ArrowUp') input(); });
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
